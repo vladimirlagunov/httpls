@@ -14,7 +14,10 @@ fn start(argc: int, argv: **u8) -> int {
 fn main() {
     let listen_addr = "127.0.0.1";
     let listen_port = 8080;
-    run_server(listen_addr, listen_port);
+    match run_server(listen_addr, listen_port) {
+        Ok(_) => {},
+        Err(e) => fail!(e)
+    };
 }
 
 
@@ -24,7 +27,7 @@ fn run_server(listen_addr: &str, listen_port: u16) -> IoResult<()> {
 
     loop {
         match acceptor.accept() {
-            Ok(mut stream) => http_handler(stream),
+            Ok(stream) => http_handler(stream),
             Err(e) => println!("{}", e)
         }
     }
@@ -85,10 +88,10 @@ impl HTTPHeader {
 }
 
 enum HTTPResponseCode {
-    HTTP_200,
-    HTTP_301, HTTP_302,
-    HTTP_400, HTTP_403, HTTP_404,
-    HTTP_500
+    HTTP200,
+    HTTP301, HTTP302,
+    HTTP400, HTTP403, HTTP404,
+    HTTP500
 }
 
 
@@ -98,7 +101,7 @@ static NEW_LINE: u8 = 13;
 
 fn make_http_400() -> HTTPResponse {
     HTTPResponse::new(
-        HTTP_400,
+        HTTP400,
         vec![HTTPHeader::new(String::from_str("Content-Type"),
                              String::from_str("text-html; charset=utf-8"))],
         box "<h1>Bad request</h1>".bytes())
@@ -106,15 +109,15 @@ fn make_http_400() -> HTTPResponse {
 
 fn make_http_500() -> HTTPResponse {
     HTTPResponse::new(
-        HTTP_500,
+        HTTP500,
         vec![HTTPHeader::new(String::from_str("Content-Type"),
                              String::from_str("text-html; charset=utf-8"))],
         box "<h1>Server error</h1>".bytes())
 }
 
 
-fn http_handler(mut stream: TcpStream) {
-    let mut reader = BufferedReader::with_capacity(4000, stream.clone());
+fn http_handler(stream: TcpStream) {
+    let reader = BufferedReader::with_capacity(4000, stream.clone());
     let response = match _http_get_request_and_headers(reader) {
         Ok((request, reader)) => {
             match handler(request, reader) {
@@ -158,14 +161,14 @@ fn _http_get_request_and_headers<R: Buffer>
     };
 
     let path = match first_line_iter.next() {
-        Some(path) => path,
+        Some(path) => String::from_str(path),
         None => return Err(ParseError)
     };
 
     let mut headers = Vec::<HTTPHeader>::with_capacity(16);
     loop {
         let line = try!(_http_read_line(&mut reader));
-        if (line.as_slice().chars().count() == 0) { break; };
+        if line.as_slice().chars().count() == 0 { break; };
 
         let mut header_iter = line.as_slice().splitn(':', 1);
         match (header_iter.next(), header_iter.next()) {
@@ -178,12 +181,11 @@ fn _http_get_request_and_headers<R: Buffer>
         };
     }
 
-    Ok((HTTPRequest::new(method, String::from_str(""), headers),
-        reader))
+    Ok((HTTPRequest::new(method, path, headers), reader))
 }
 
 
-fn _http_read_line<R: Buffer>(mut reader: &mut R) -> Result<String, HttpParseError> {
+fn _http_read_line<R: Buffer>(reader: &mut R) -> Result<String, HttpParseError> {
     let result = match reader.read_until(CARRIAGE_RETURN) {
         Ok(line_bytes) => match String::from_utf8(line_bytes) {
             Ok(line) => line,
@@ -218,13 +220,13 @@ fn _http_send_response(mut response: HTTPResponse, stream: TcpStream) -> IoResul
 
     try!(writer.write_str("HTTP "));
     try!(writer.write_str(match response.code {
-        HTTP_200 => "200 OK",
-        HTTP_301 => "301 Moved",
-        HTTP_302 => "302 Moved Permanently",
-        HTTP_400 => "400 Bad Request",
-        HTTP_403 => "403 Not Authorized",
-        HTTP_404 => "404 Not Found",
-        HTTP_500 => "500 Server Error"
+        HTTP200 => "200 OK",
+        HTTP301 => "301 Moved",
+        HTTP302 => "302 Moved Permanently",
+        HTTP400 => "400 Bad Request",
+        HTTP403 => "403 Not Authorized",
+        HTTP404 => "404 Not Found",
+        HTTP500 => "500 Server Error"
     }));
     try!(writer.write_u8(CARRIAGE_RETURN));
     try!(writer.write_u8(NEW_LINE));
@@ -253,10 +255,14 @@ fn _http_send_response(mut response: HTTPResponse, stream: TcpStream) -> IoResul
 }
 
 
-fn handler<R: Reader>(request: HTTPRequest, ref mut reader: R) -> Result<HTTPResponse, ()> {
-    Ok(HTTPResponse::new(
-        HTTP_200,
-        vec![HTTPHeader::new(String::from_str("Content-Type"),
-                             String::from_str("text-html; charset=utf-8"))],
-        box "<h1>Hello world!</h1>".bytes()))
+fn handler<R: Reader>(request: HTTPRequest, ref reader: R) -> Result<HTTPResponse, ()> {
+    match (request.method, request.path) {
+        (GET, ref path) if path == &String::from_str("/") => Ok(
+            HTTPResponse::new(
+                HTTP200,
+                vec![HTTPHeader::new(String::from_str("Content-Type"),
+                                 String::from_str("text-html; charset=utf-8"))],
+                box "<h1>Hello world!</h1>".bytes())),
+        _ => Ok(make_http_400())
+    }
 }
