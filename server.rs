@@ -95,8 +95,8 @@ enum HTTPResponseCode {
 }
 
 
-static CARRIAGE_RETURN: u8 = 10;
-static NEW_LINE: u8 = 13;
+static CARRIAGE_RETURN: u8 = 13;
+static NEW_LINE: u8 = 10;
 
 
 fn make_http_400() -> HTTPResponse {
@@ -187,14 +187,18 @@ fn _http_get_request_and_headers<R: Buffer>
 
 fn _http_read_line<R: Buffer>(reader: &mut R) -> Result<String, HttpParseError> {
     let result = match reader.read_until(CARRIAGE_RETURN) {
-        Ok(line_bytes) => match String::from_utf8(line_bytes) {
-            Ok(line) => line,
-            _ => return Err(ParseError)
+        Ok(line_bytes) => {
+            let line_string = match String::from_utf8(line_bytes) {
+                Ok(line) => line,
+                _ => return Err(ParseError)
+            };
+            let line_bytes = line_string.as_slice().trim_right_chars(CARRIAGE_RETURN as char);
+            String::from_str(line_bytes)
         },
         Err(e) => return Err(IoError(e))
     };
-    match reader.read_char() {
-        Ok(' ') => Ok(result),
+    match reader.read_u8() {
+        Ok(NEW_LINE) => Ok(result),
         Ok(_) => Err(ParseError),
         Err(e) => Err(IoError(e))
     }
@@ -246,6 +250,8 @@ fn _http_send_response(mut response: HTTPResponse, stream: TcpStream) -> IoResul
 
     try!(writer.write_u8(CARRIAGE_RETURN));
     try!(writer.write_u8(NEW_LINE));
+
+    writer.flush();
 
     for byte in response.content {
         try!(writer.write_u8(byte))
