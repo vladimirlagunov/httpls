@@ -3,7 +3,7 @@
 extern crate green;
 extern crate rustuv;
 
-use std::io::{TcpStream, BufferedReader, IoResult, Reader, Buffer, IoError};
+use std::io::{TcpListener, TcpStream, BufferedReader, BufferedWriter, IoResult, Reader, Buffer, IoError, Acceptor, Listener};
 
 #[start]
 fn start(argc: int, argv: **u8) -> int {
@@ -12,8 +12,24 @@ fn start(argc: int, argv: **u8) -> int {
 
 
 fn main() {
-    let listen_addr = String::from_str("127.0.0.1");
+    let listen_addr = "127.0.0.1";
     let listen_port = 8080;
+    run_server(listen_addr, listen_port);
+}
+
+
+fn run_server(listen_addr: &str, listen_port: u16) -> IoResult<()> {
+    let listener = try!(TcpListener::bind(listen_addr, listen_port));
+    let mut acceptor = try!(listener.listen());
+
+    loop {
+        match acceptor.accept() {
+            Ok(mut stream) => http_handler(stream),
+            Err(e) => println!("{}", e)
+        }
+    }
+
+    Ok(())
 }
 
 
@@ -62,6 +78,11 @@ struct HTTPHeader {
     value: String
 }
 
+impl HTTPHeader {
+    fn new(key: String, value: String) -> HTTPHeader {
+        HTTPHeader{key: key, value: value}
+    }
+}
 
 enum HTTPResponseCode {
     HTTP_200,
@@ -75,10 +96,46 @@ static CARRIAGE_RETURN: u8 = 10;
 static NEW_LINE: u8 = 13;
 
 
-fn http_handler(mut stream: TcpStream) {
-    let mut reader = BufferedReader::with_capacity(4000, stream);
-    let _ = _http_get_request_and_headers(reader);
+fn make_http_400() -> HTTPResponse {
+    HTTPResponse::new(
+        HTTP_400,
+        vec![HTTPHeader::new(String::from_str("Content-Type"),
+                             String::from_str("text-html; charset=utf-8"))],
+        box "<h1>Bad request</h1>".bytes())
 }
+
+fn make_http_500() -> HTTPResponse {
+    HTTPResponse::new(
+        HTTP_500,
+        vec![HTTPHeader::new(String::from_str("Content-Type"),
+                             String::from_str("text-html; charset=utf-8"))],
+        box "<h1>Server error</h1>".bytes())
+}
+
+
+fn http_handler(mut stream: TcpStream) {
+    let mut reader = BufferedReader::with_capacity(4000, stream.clone());
+    let response = match _http_get_request_and_headers(reader) {
+        Ok((request, reader)) => {
+            match handler(request, reader) {
+                Ok(response) => Some(response),
+                _ => Some(make_http_500())
+            }
+        },
+        Err(ParseError) => {
+            Some(make_http_400())
+        },
+        Err(IoError(_)) => None
+    };
+    match response {
+        Some(response) => {
+            _http_send_response(response, stream);
+        },
+        None => {}
+    };
+    ()
+}
+
 
 enum HttpParseError {
     IoError(IoError), ParseError
@@ -86,10 +143,10 @@ enum HttpParseError {
 
 
 fn _http_get_request_and_headers<R: Buffer>
-    (ref mut reader: R)
-     -> Result<HTTPRequest, HttpParseError>
+    (mut reader: R)
+     -> Result<(HTTPRequest, R), HttpParseError>
 {
-    let first_line = try!(_http_read_line(reader));
+    let first_line = try!(_http_read_line(&mut reader));
     let mut first_line_iter = first_line.as_slice().split(' ');
 
     let method = match first_line_iter.next() {
@@ -105,9 +162,9 @@ fn _http_get_request_and_headers<R: Buffer>
         None => return Err(ParseError)
     };
 
-    let mut headers = Vec::<HTTPHeader>::new();
+    let mut headers = Vec::<HTTPHeader>::with_capacity(16);
     loop {
-        let line = try!(_http_read_line(reader));
+        let line = try!(_http_read_line(&mut reader));
         if (line.as_slice().chars().count() == 0) { break; };
 
         let mut header_iter = line.as_slice().splitn(':', 1);
@@ -121,8 +178,10 @@ fn _http_get_request_and_headers<R: Buffer>
         };
     }
 
-    Ok(HTTPRequest::new(method, String::from_str(""), headers))
+    Ok((HTTPRequest::new(method, String::from_str(""), headers),
+        reader))
 }
+
 
 fn _http_read_line<R: Buffer>(mut reader: &mut R) -> Result<String, HttpParseError> {
     let result = match reader.read_until(CARRIAGE_RETURN) {
@@ -140,7 +199,64 @@ fn _http_read_line<R: Buffer>(mut reader: &mut R) -> Result<String, HttpParseErr
 }
 
 
-// Может лучше proc() ?
-trait HTTPServer {
-    fn handle(method: HTTPMethod, headers: Vec<HTTPHeader>, stream: TcpStream);
+struct HTTPResponse {
+    code: HTTPResponseCode,
+    headers: Vec<HTTPHeader>,
+    content: Box<Iterator<u8>>
+}
+
+impl HTTPResponse {
+    fn new(code: HTTPResponseCode, headers: Vec<HTTPHeader>, content: Box<Iterator<u8>>)
+           -> HTTPResponse {
+        HTTPResponse{code: code, headers: headers, content: content}
+    }
+}
+
+
+fn _http_send_response(mut response: HTTPResponse, stream: TcpStream) -> IoResult<()> {
+    let mut writer = BufferedWriter::with_capacity(1500, stream.clone());
+
+    try!(writer.write_str("HTTP "));
+    try!(writer.write_str(match response.code {
+        HTTP_200 => "200 OK",
+        HTTP_301 => "301 Moved",
+        HTTP_302 => "302 Moved Permanently",
+        HTTP_400 => "400 Bad Request",
+        HTTP_403 => "403 Not Authorized",
+        HTTP_404 => "404 Not Found",
+        HTTP_500 => "500 Server Error"
+    }));
+    try!(writer.write_u8(CARRIAGE_RETURN));
+    try!(writer.write_u8(NEW_LINE));
+    let mut headers = response.headers;
+    loop {
+        match headers.pop() {
+            Some(header) => {
+                try!(writer.write(header.key.into_bytes().as_slice()));
+                try!(writer.write_str(": "));
+                try!(writer.write(header.value.into_bytes().as_slice()));
+                try!(writer.write_u8(CARRIAGE_RETURN));
+                try!(writer.write_u8(NEW_LINE));
+            },
+            None => break
+        }
+    }
+
+    try!(writer.write_u8(CARRIAGE_RETURN));
+    try!(writer.write_u8(NEW_LINE));
+
+    for byte in response.content {
+        try!(writer.write_u8(byte))
+    }
+
+    Ok(())
+}
+
+
+fn handler<R: Reader>(request: HTTPRequest, ref mut reader: R) -> Result<HTTPResponse, ()> {
+    Ok(HTTPResponse::new(
+        HTTP_200,
+        vec![HTTPHeader::new(String::from_str("Content-Type"),
+                             String::from_str("text-html; charset=utf-8"))],
+        box "<h1>Hello world!</h1>".bytes()))
 }
