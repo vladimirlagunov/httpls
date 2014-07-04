@@ -1,7 +1,9 @@
 #![feature(macro_rules)]
+#![feature(phase)]
 #![allow(experimental)]
 extern crate green;
 extern crate rustuv;
+#[phase(plugin, link)] extern crate log;
 
 use std::io::{TcpListener, TcpStream, BufferedReader, BufferedWriter, IoResult, Reader, Buffer, IoError, Acceptor, Listener};
 
@@ -38,6 +40,16 @@ fn run_server(listen_addr: &str, listen_port: u16) -> IoResult<()> {
 
 enum HTTPMethod {
     GET, POST, HEAD
+}
+
+impl std::fmt::Show for HTTPMethod {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> Result<(), std::fmt::FormatError> {
+        match *self {
+            GET => fmt.write("GET".as_bytes()),
+            POST => fmt.write("POST".as_bytes()),
+            HEAD => fmt.write("HEAD".as_bytes())
+        }
+    }
 }
 
 
@@ -94,6 +106,18 @@ enum HTTPResponseCode {
     HTTP500
 }
 
+impl std::fmt::Show for HTTPResponseCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::FormatError> {
+        write!(f, "{}", match *self {
+            HTTP200 => 200u16,
+            HTTP301 => 301, HTTP302 => 302,
+            HTTP400 => 400, HTTP403 => 403, HTTP404 => 404,
+            HTTP500 => 500
+        })
+    }
+}
+
+
 
 static CARRIAGE_RETURN: u8 = 13;
 static NEW_LINE: u8 = 10;
@@ -107,6 +131,14 @@ fn make_http_400() -> HTTPResponse {
         box "<h1>Bad request</h1>".bytes())
 }
 
+fn make_http_404() -> HTTPResponse {
+    HTTPResponse::new(
+        HTTP404,
+        vec![HTTPHeader::new(String::from_str("Content-Type"),
+                             String::from_str("text-html; charset=utf-8"))],
+        box "<h1>Not found</h1>".bytes())
+}
+
 fn make_http_500() -> HTTPResponse {
     HTTPResponse::new(
         HTTP500,
@@ -116,23 +148,37 @@ fn make_http_500() -> HTTPResponse {
 }
 
 
-fn http_handler(stream: TcpStream) {
+fn http_handler(mut stream: TcpStream) {
     let reader = BufferedReader::with_capacity(4000, stream.clone());
-    let response = match _http_get_request_and_headers(reader) {
+    let peer_name = stream.peer_name();
+    let (request, response) = match _http_get_request_and_headers(reader) {
         Ok((request, reader)) => {
-            match handler(request, reader) {
+            let response = match handler(&request, reader) {
                 Ok(response) => Some(response),
                 _ => Some(make_http_500())
-            }
+            };
+            (Some(request), response)
         },
         Err(ParseError) => {
-            Some(make_http_400())
+            (None, Some(make_http_400()))
         },
-        Err(IoError(_)) => None
+        Err(IoError(_)) => (None, None)
     };
     match response {
         Some(response) => {
+            let code = response.code;
             _http_send_response(response, stream);
+            let peer_name = match peer_name {
+                Ok(addr) => format!("{}", addr),
+                _ => String::from_str("???")
+            };
+            match request {
+                Some(request) =>
+                    info!("[{}] {} \"{}\" => {}",
+                          peer_name, request.method, request.path, code),
+                None =>
+                    info!("[{}] ??? => {}", peer_name, code)
+            };
         },
         None => {}
     };
@@ -261,14 +307,16 @@ fn _http_send_response(mut response: HTTPResponse, stream: TcpStream) -> IoResul
 }
 
 
-fn handler<R: Reader>(request: HTTPRequest, ref reader: R) -> Result<HTTPResponse, ()> {
-    match (request.method, request.path) {
-        (GET, ref path) if path == &String::from_str("/") => Ok(
+fn handler<R: Reader>(request: &HTTPRequest, ref reader: R) -> Result<HTTPResponse, ()> {
+    let response = match (request.method, &request.path) {
+        (GET, path) if path == &String::from_str("/") =>
             HTTPResponse::new(
                 HTTP200,
                 vec![HTTPHeader::new(String::from_str("Content-Type"),
                                  String::from_str("text-html; charset=utf-8"))],
-                box "<h1>Hello world!</h1>".bytes())),
-        _ => Ok(make_http_400())
-    }
+                box "<h1>Hello world!</h1>".bytes()),
+        (GET, _) => make_http_404(),
+        _ => make_http_400()
+    };
+    Ok(response)
 }
