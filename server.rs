@@ -106,6 +106,18 @@ enum HTTPResponseCode {
     HTTP500
 }
 
+
+enum HttpParseError {
+    IoError(IoError), ParseError
+}
+
+struct HTTPResponse {
+    code: HTTPResponseCode,
+    headers: Vec<HTTPHeader>,
+    content_writer: proc(mut writer: BufferedWriter<TcpStream>)
+}
+
+
 impl std::fmt::Show for HTTPResponseCode {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::FormatError> {
         write!(f, "{}", match *self {
@@ -121,46 +133,43 @@ impl std::fmt::Show for HTTPResponseCode {
 
 static CARRIAGE_RETURN: u8 = 13;
 static NEW_LINE: u8 = 10;
+static RN: [u8, ..2] = [CARRIAGE_RETURN, NEW_LINE];
 
 
-fn make_http_400() -> HTTPResponse {
-    HTTPResponse::new(
-        HTTP400,
-        vec![HTTPHeader::new(String::from_str("Content-Type"),
-                             String::from_str("text-html; charset=utf-8"))],
-        box "<h1>Bad request</h1>".bytes())
-}
-
-fn make_http_404() -> HTTPResponse {
-    HTTPResponse::new(
-        HTTP404,
-        vec![HTTPHeader::new(String::from_str("Content-Type"),
-                             String::from_str("text-html; charset=utf-8"))],
-        box "<h1>Not found</h1>".bytes())
-}
-
-fn make_http_500() -> HTTPResponse {
-    HTTPResponse::new(
-        HTTP500,
-        vec![HTTPHeader::new(String::from_str("Content-Type"),
-                             String::from_str("text-html; charset=utf-8"))],
-        box "<h1>Server error</h1>".bytes())
+fn error_page_response(response_code: HTTPResponseCode) -> HTTPResponse {
+    HTTPResponse {
+        code: response_code,
+        headers: vec![HTTPHeader::new(String::from_str("Content-Type"),
+                                      String::from_str("text-html; charset=utf-8"))],
+        content_writer: proc(mut buf) {
+            buf.write_str("<h1>");
+            buf.write(format!("{}", response_code).as_bytes());
+            buf.write_str(match response_code {
+                HTTP400 => " Bad Request",
+                HTTP403 => " Access Denied",
+                HTTP404 => " Not Found",
+                HTTP500 => " Server Error",
+                _ => ""
+            });
+            buf.write_str("</h1>");
+        }
+    }
 }
 
 
 fn http_handler(mut stream: TcpStream) {
-    let reader = BufferedReader::with_capacity(4000, stream.clone());
+    let reader = BufferedReader::with_capacity(1500, stream.clone());
     let peer_name = stream.peer_name();
     let (request, response) = match _http_get_request_and_headers(reader) {
         Ok((request, reader)) => {
             let response = match handler(&request, reader) {
                 Ok(response) => Some(response),
-                _ => Some(make_http_500())
+                _ => Some(error_page_response(HTTP500))
             };
             (Some(request), response)
         },
         Err(ParseError) => {
-            (None, Some(make_http_400()))
+            (None, Some(error_page_response(HTTP400)))
         },
         Err(IoError(_)) => (None, None)
     };
@@ -183,11 +192,6 @@ fn http_handler(mut stream: TcpStream) {
         None => {}
     };
     ()
-}
-
-
-enum HttpParseError {
-    IoError(IoError), ParseError
 }
 
 
@@ -251,20 +255,6 @@ fn _http_read_line<R: Buffer>(reader: &mut R) -> Result<String, HttpParseError> 
 }
 
 
-struct HTTPResponse {
-    code: HTTPResponseCode,
-    headers: Vec<HTTPHeader>,
-    content: Box<Iterator<u8>>
-}
-
-impl HTTPResponse {
-    fn new(code: HTTPResponseCode, headers: Vec<HTTPHeader>, content: Box<Iterator<u8>>)
-           -> HTTPResponse {
-        HTTPResponse{code: code, headers: headers, content: content}
-    }
-}
-
-
 fn _http_send_response(mut response: HTTPResponse, stream: TcpStream) -> IoResult<()> {
     let mut writer = BufferedWriter::with_capacity(1500, stream.clone());
 
@@ -299,9 +289,8 @@ fn _http_send_response(mut response: HTTPResponse, stream: TcpStream) -> IoResul
 
     writer.flush();
 
-    for byte in response.content {
-        try!(writer.write_u8(byte))
-    }
+    let content_writer: proc(BufferedWriter<TcpStream>) = response.content_writer;
+    content_writer(BufferedWriter::with_capacity(1500, stream));
 
     Ok(())
 }
@@ -310,13 +299,16 @@ fn _http_send_response(mut response: HTTPResponse, stream: TcpStream) -> IoResul
 fn handler<R: Reader>(request: &HTTPRequest, ref reader: R) -> Result<HTTPResponse, ()> {
     let response = match (request.method, &request.path) {
         (GET, path) if path == &String::from_str("/") =>
-            HTTPResponse::new(
-                HTTP200,
-                vec![HTTPHeader::new(String::from_str("Content-Type"),
-                                 String::from_str("text-html; charset=utf-8"))],
-                box "<h1>Hello world!</h1>".bytes()),
-        (GET, _) => make_http_404(),
-        _ => make_http_400()
+            HTTPResponse { 
+                code: HTTP200,
+                headers: vec![HTTPHeader::new(String::from_str("Content-Type"),
+                                              String::from_str("text-html; charset=utf-8"))],
+                content_writer: proc(mut buf) {
+                    buf.write_str("<h1>Hello world!</h1>");
+                }
+            },
+        (GET, _) => error_page_response(HTTP404),
+        _ => error_page_response(HTTP400)
     };
     Ok(response)
 }
