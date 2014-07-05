@@ -160,18 +160,21 @@ fn error_page_response(response_code: HTTPResponseCode) -> HTTPResponse {
 fn http_handler(mut stream: TcpStream) {
     let reader = BufferedReader::with_capacity(1500, stream.clone());
     let peer_name = stream.peer_name();
-    let (request, response) = match _http_get_request_and_headers(reader) {
+    let (request_method, request_path, response
+         ) = match _http_get_request_and_headers(reader) {
         Ok((request, reader)) => {
-            let response = match handler(&request, reader) {
+            let request_method = request.method;
+            let request_path = request.path.clone();
+            let response = match handler(request, reader) {
                 Ok(response) => Some(response),
                 _ => Some(error_page_response(HTTP500))
             };
-            (Some(request), response)
+            (Some(request_method), Some(request_path), response)
         },
         Err(ParseError) => {
-            (None, Some(error_page_response(HTTP400)))
+            (None, None, Some(error_page_response(HTTP400)))
         },
-        Err(IoError(_)) => (None, None)
+        Err(IoError(_)) => (None, None, None)
     };
     match response {
         Some(response) => {
@@ -181,11 +184,11 @@ fn http_handler(mut stream: TcpStream) {
                 Ok(addr) => format!("{}", addr),
                 _ => String::from_str("???")
             };
-            match request {
-                Some(request) =>
+            match (request_method, request_path) {
+                (Some(request_method), Some(request_path)) =>
                     info!("[{}] {} \"{}\" => {}",
-                          peer_name, request.method, request.path, code),
-                None =>
+                          peer_name, request_method, request_path, code),
+                _ =>
                     info!("[{}] ??? => {}", peer_name, code)
             };
         },
@@ -296,17 +299,25 @@ fn _http_send_response(mut response: HTTPResponse, stream: TcpStream) -> IoResul
 }
 
 
-fn handler<R: Reader>(request: &HTTPRequest, ref reader: R) -> Result<HTTPResponse, ()> {
-    let response = match (request.method, &request.path) {
-        (GET, path) if path == &String::from_str("/") =>
+fn handler<R: Reader>(request: HTTPRequest, ref reader: R) -> Result<HTTPResponse, ()> {
+    let response = match (request.method, request.path.clone()) {
+        (GET, ref path) if path == &String::from_str("/") => {
             HTTPResponse { 
                 code: HTTP200,
                 headers: vec![HTTPHeader::new(String::from_str("Content-Type"),
                                               String::from_str("text-html; charset=utf-8"))],
                 content_writer: proc(mut buf) {
                     buf.write_str("<h1>Hello world!</h1>");
+
+                    buf.write_str("<p>Your headers:</p><table>");
+                    for header in request.headers.iter() {
+                        write!(buf, "<tr><td><b>{}</b></td><td>{}</td></tr>",
+                               header.key, header.value);
+                    }
+                    buf.write_str("</table>");
                 }
-            },
+            }
+        },
         (GET, _) => error_page_response(HTTP404),
         _ => error_page_response(HTTP400)
     };
