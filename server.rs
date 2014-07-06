@@ -8,10 +8,10 @@ extern crate rustuv;
 use std::io::{TcpListener, TcpStream, BufferedReader, BufferedWriter, IoResult, Reader, Buffer, IoError, Acceptor, Listener};
 use std::rc::Rc;
 
-#[start]
-fn start(argc: int, argv: *const *const u8) -> int {
-    green::start(argc, argv, rustuv::event_loop, main)
-}
+// #[start]
+// fn start(argc: int, argv: *const *const u8) -> int {
+//     green::start(argc, argv, rustuv::event_loop, main)
+// }
 
 
 fn main() {
