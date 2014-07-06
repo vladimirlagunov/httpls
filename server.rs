@@ -17,14 +17,15 @@ use std::rc::Rc;
 fn main() {
     let listen_addr = "127.0.0.1";
     let listen_port = 8080;
-    match run_server(listen_addr, listen_port) {
+    match run_server(listen_addr, listen_port, hello_world_handler) {
         Ok(_) => {},
         Err(e) => fail!(e)
     };
 }
 
 
-fn run_server(listen_addr: &str, listen_port: u16) -> IoResult<()> {
+fn run_server(listen_addr: &str, listen_port: u16, handler: HttpHandlerFn)
+              -> IoResult<()> {
     let listener = try!(TcpListener::bind(listen_addr, listen_port));
     let mut acceptor = try!(listener.listen());
 
@@ -32,7 +33,7 @@ fn run_server(listen_addr: &str, listen_port: u16) -> IoResult<()> {
         match acceptor.accept() {
             Ok(stream) => {
                 std::task::spawn(proc() {
-                    http_handler(stream, hello_world_handler);
+                    http_handler(stream, handler);
                 });
             },
             Err(e) => println!("{}", e)
@@ -58,20 +59,9 @@ impl std::fmt::Show for HTTPMethod {
 }
 
 
-trait HTTPMethodConvert {
-    fn to_httpmethod(&self) -> Option<HTTPMethod>;
-}
-
-impl HTTPMethodConvert for String {
-    fn to_httpmethod(&self) -> Option<HTTPMethod> {
-        self.as_slice().to_httpmethod()
-    }
-}
-
-
-impl <'a>HTTPMethodConvert for &'a str {
-    fn to_httpmethod(&self) -> Option<HTTPMethod> {
-        match *self {
+impl std::from_str::FromStr for HTTPMethod {
+    fn from_str(s: &str) -> Option<HTTPMethod> {
+        match s {
             "GET" => Some(GET),
             "POST" => Some(POST),
             "HEAD" => Some(HEAD),
@@ -87,11 +77,6 @@ struct HTTPRequest {
     headers: Vec<HTTPHeader>
 }
 
-impl HTTPRequest {
-    fn new(method: HTTPMethod, path: String, headers: Vec<HTTPHeader>) -> HTTPRequest {
-        HTTPRequest{method: method, path: path, headers: headers}
-    }
-}
 
 struct HTTPHeader {
     key: String,
@@ -173,22 +158,24 @@ fn error_page_response(response_code: HTTPResponseCode)
 fn http_handler(mut stream: TcpStream, handler: HttpHandlerFn) {
     let mut reader = BufferedReader::with_capacity(1500, stream.clone());
     let peer_name = stream.peer_name();
+
     let (request, response_pair): (
-        Option<Rc<HTTPRequest>>, Option<(HTTPResponse, ResponseWriterFn)>) =
-        match _http_get_request_and_headers(&mut reader) {
-            Ok(request) => {
-                let request = Rc::new(request);
-                let response_pair = match handler(request.clone(), reader) {
-                    Ok(response_pair) => response_pair,
-                    _ => error_page_response(HTTP500)
-                };
-                (Some(request), Some(response_pair))
-            },
-            Err(ParseError) => {
-                (None, Some(error_page_response(HTTP400)))
-            },
-            Err(IoError(_)) => (None, None)
-        };
+        Option<Rc<HTTPRequest>>, Option<(HTTPResponse, ResponseWriterFn)>
+            ) = match _http_get_request_and_headers(&mut reader) {
+        Ok(request) => {
+            let request = Rc::new(request);
+            let response_pair = match handler(request.clone(), reader) {
+                Ok(response_pair) => response_pair,
+                _ => error_page_response(HTTP500)
+            };
+            (Some(request), Some(response_pair))
+        },
+        Err(ParseError) => {
+            (None, Some(error_page_response(HTTP400)))
+        },
+        Err(IoError(_)) => (None, None)
+    };
+
     match response_pair {
         Some((response, response_fn)) => {
             let code = response.code;
@@ -224,7 +211,7 @@ fn _http_get_request_and_headers
     let mut first_line_iter = first_line.as_slice().split(' ');
 
     let method = match first_line_iter.next() {
-        Some(method) => match method.to_httpmethod() {
+        Some(method) => match from_str(method) {
             Some(method) => method,
             None => return Err(ParseError)
         },
@@ -252,7 +239,7 @@ fn _http_get_request_and_headers
         };
     }
 
-    Ok(HTTPRequest::new(method, path, headers))
+    Ok(HTTPRequest{method: method, path: path, headers: headers})
 }
 
 
