@@ -1,12 +1,11 @@
-#![crate_name="httpls"]
+#![crate_name="http_server2"]
 #![crate_type="lib"]
 #![feature(macro_rules, phase)]
 #![allow(experimental)]
 
 #[phase(plugin,link)] extern crate log;
 
-use std::io::{TcpListener, TcpStream, BufferedReader, BufferedWriter, IoResult, Reader, Buffer, IoError, Acceptor, Listener};
-use std::rc::Rc;
+use std::io::{TcpListener, TcpStream, BufferedReader, BufferedWriter, IoResult, Reader, Buffer, Acceptor, Listener};
 use std::collections::HashMap;
 
 
@@ -47,20 +46,20 @@ pub trait HTTPResponseWriter<W: Writer> {
 
 
 pub struct HTTPHandler<'hndl, 'req, R: Reader, W: Writer> {
-    handler: Box<HTTPRequestHandler<'hndl, 'req, R, W> + 'hndl>,
-    host: String
+    pub handler: Box<HTTPRequestHandler<'hndl, 'req, R, W> + 'hndl>,
+    pub host: String
 }
 
 
 impl <'hndl, 'resp, R: Reader, W: Writer>HTTPHandler<'hndl, 'resp, R, W> {
     fn handle(&'hndl self,
-              mut reader: BufferedReader<R>,
+              reader: BufferedReader<R>,
               mut writer: BufferedWriter<W>)
               -> IoResult<()>
     {
         let (response_code, response_headers, response_writer) =
             match handle_http_request(&*self.handler, reader) {
-                Err(_) | Ok(None) => test_res(),
+                Err(_) | Ok(None) => bad_response(),
                     // (HTTP400, box HashMap::new(), box BytesResponseWriter{bytes: vec![]}),
                 Ok(Some(x)) => x
             };
@@ -73,7 +72,7 @@ impl <'hndl, 'resp, R: Reader, W: Writer>HTTPHandler<'hndl, 'resp, R, W> {
     }
 }
 
-fn test_res<'resp, W: Writer>() -> (HTTPResponseCode, Box<HTTPHeaders>, Box<HTTPResponseWriter<W> + 'resp>) {
+fn bad_response<'resp, W: Writer>() -> (HTTPResponseCode, Box<HTTPHeaders>, Box<HTTPResponseWriter<W> + 'resp>) {
     (HTTP400, box HashMap::new(), box BytesResponseWriter{bytes: vec![]})
 }
 
@@ -108,7 +107,7 @@ fn handle_http_request<'hndl, 'req, R: Reader, W: Writer>
         loop {
             let line = try!(reader.read_until('\n' as u8));
 
-            if (*line.get(line.len() - 2)) != '\r' as u8 { return Ok(None) }
+            if (line[line.len() - 2]) != '\r' as u8 { return Ok(None) }
 
             if line.len() == 2 { break }
 
@@ -137,6 +136,13 @@ fn handle_http_request<'hndl, 'req, R: Reader, W: Writer>
 
 pub struct BytesResponseWriter {
     bytes: Vec<u8>
+}
+
+
+impl <'a, W: Writer>BytesResponseWriter {
+    pub fn new(bytes: Vec<u8>) -> Box<HTTPResponseWriter<W> + 'a> {
+        box BytesResponseWriter{bytes: bytes}
+    }
 }
 
 
@@ -171,4 +177,32 @@ fn start_http_response<W: Writer>
 
     try!(writer.write_str("\r\n"));
     Ok(())
+}
+
+
+
+pub struct SingleThreadHTTPServer {
+    pub host: String,
+    pub port: u16,
+}
+
+
+impl <'server, 'hndl, 'req>SingleThreadHTTPServer {
+    pub fn serve(&'server self,
+                 handler: &'hndl HTTPHandler<'hndl, 'req, TcpStream, TcpStream>)
+                 -> IoResult<()> {
+        let listener = TcpListener::bind(self.host.as_slice(), self.port);
+
+        let mut acceptor = listener.listen();
+
+        for stream in acceptor.incoming() {
+            let stream = try!(stream);
+
+            let reader = BufferedReader::new(stream.clone());
+            let writer = BufferedWriter::new(stream);
+
+            try!(handler.handle(reader, writer));
+        }
+        Ok(())
+    }
 }

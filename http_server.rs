@@ -1,50 +1,15 @@
-#![feature(macro_rules)]
-#![feature(phase)]
+#![crate_name="httpls"]
+#![crate_type="lib"]
+#![feature(macro_rules, phase)]
 #![allow(experimental)]
-extern crate green;
-extern crate rustuv;
-#[phase(plugin, link)] extern crate log;
+
+#[phase(plugin,link)] extern crate log;
 
 use std::io::{TcpListener, TcpStream, BufferedReader, BufferedWriter, IoResult, Reader, Buffer, IoError, Acceptor, Listener};
 use std::rc::Rc;
 
-// #[start]
-// fn start(argc: int, argv: *const *const u8) -> int {
-//     green::start(argc, argv, rustuv::event_loop, main)
-// }
 
-
-fn main() {
-    let listen_addr = "127.0.0.1";
-    let listen_port = 8080;
-    match run_server(listen_addr, listen_port, hello_world_handler) {
-        Ok(_) => {},
-        Err(e) => fail!(e)
-    };
-}
-
-
-fn run_server(listen_addr: &str, listen_port: u16, handler: HttpHandlerFn)
-              -> IoResult<()> {
-    let listener = try!(TcpListener::bind(listen_addr, listen_port));
-    let mut acceptor = try!(listener.listen());
-
-    loop {
-        match acceptor.accept() {
-            Ok(stream) => {
-                std::task::spawn(proc() {
-                    http_handler(stream, handler);
-                });
-            },
-            Err(e) => println!("{}", e)
-        }
-    }
-
-    Ok(())
-}
-
-
-enum HTTPMethod {
+pub enum HTTPMethod {
     GET, POST, HEAD
 }
 
@@ -71,16 +36,16 @@ impl std::from_str::FromStr for HTTPMethod {
 }
 
 
-struct HTTPRequest {
-    method: HTTPMethod,
-    path: String,
-    headers: Vec<HTTPHeader>
+pub struct HTTPRequest {
+    pub method: HTTPMethod,
+    pub path: String,
+    pub headers: Vec<HTTPHeader>
 }
 
 
-struct HTTPHeader {
-    key: String,
-    value: String
+pub struct HTTPHeader {
+    pub key: String,
+    pub value: String
 }
 
 impl HTTPHeader {
@@ -89,26 +54,32 @@ impl HTTPHeader {
     }
 }
 
-enum HTTPResponseCode {
+pub enum HTTPResponseCode {
     HTTP200,
     HTTP301, HTTP302,
-    HTTP400, HTTP403, HTTP404,
+    HTTP400, HTTP401, HTTP403, HTTP404,
     HTTP500
 }
 
 
 enum HttpParseError {
-    IoError(IoError), ParseError
+    IOError(IoError), ParseError
 }
 
-struct HTTPResponse {
-    code: HTTPResponseCode,
-    headers: Vec<HTTPHeader>
+pub struct HTTPResponse {
+    pub code: HTTPResponseCode,
+    pub headers: Vec<HTTPHeader>,
+    pub content_length: Option<u64>,
 }
 
-type HttpHandlerFn = fn (Rc<HTTPRequest>, BufferedReader<TcpStream>)
-                         -> Result<(HTTPResponse, ResponseWriterFn), ()>;
-type ResponseWriterFn = proc(BufferedWriter<TcpStream>) -> IoResult<()>;
+
+pub trait HTTPHandler<T> {
+    pub fn handle(request: &HTTPRequest)
+}
+
+pub type HttpHandlerFn = fn (Rc<HTTPRequest>, BufferedReader<TcpStream>)
+                             -> Result<(HTTPResponse, ResponseWriterFn), ()>;
+pub type ResponseWriterFn = fn (BufferedWriter<TcpStream>) -> IoResult<()>;
 
 
 impl std::fmt::Show for HTTPResponseCode {
@@ -116,46 +87,13 @@ impl std::fmt::Show for HTTPResponseCode {
         write!(f, "{}", match *self {
             HTTP200 => 200u16,
             HTTP301 => 301, HTTP302 => 302,
-            HTTP400 => 400, HTTP403 => 403, HTTP404 => 404,
+            HTTP400 => 400, HTTP401 => 401, HTTP403 => 403, HTTP404 => 404,
             HTTP500 => 500
         })
     }
 }
 
-
-
-static CARRIAGE_RETURN: u8 = 13;
-static NEW_LINE: u8 = 10;
-static RN: [u8, ..2] = [CARRIAGE_RETURN, NEW_LINE];
-
-
-fn error_page_response(response_code: HTTPResponseCode)
-                       -> (HTTPResponse, ResponseWriterFn)
-{
-    let response = HTTPResponse {
-        code: response_code,
-        headers: vec![HTTPHeader::new(String::from_str("Content-Type"),
-                                      String::from_str("text-html; charset=utf-8"))]
-    };
-    let response_fn: ResponseWriterFn
-        = proc(mut buf: BufferedWriter<TcpStream>) -> IoResult<()> {
-            try!(buf.write_str("<h1>"));
-            try!(buf.write(format!("{}", response_code).as_bytes()));
-            try!(buf.write_str(match response_code {
-                HTTP400 => " Bad Request",
-                HTTP403 => " Access Denied",
-                HTTP404 => " Not Found",
-                HTTP500 => " Server Error",
-                _ => ""
-            }));
-            try!(buf.write_str("</h1>"));
-            Ok(())
-        };
-    (response, response_fn)
-}
-
-
-fn http_handler(mut stream: TcpStream, handler: HttpHandlerFn) {
+pub fn http_handler(mut stream: TcpStream, handler: HttpHandlerFn) {
     let mut reader = BufferedReader::with_capacity(1500, stream.clone());
     let peer_name = stream.peer_name();
 
@@ -173,7 +111,7 @@ fn http_handler(mut stream: TcpStream, handler: HttpHandlerFn) {
         Err(ParseError) => {
             (None, Some(error_page_response(HTTP400)))
         },
-        Err(IoError(_)) => (None, None)
+        Err(IOError(_)) => (None, None)
     };
 
     match response_pair {
@@ -190,7 +128,7 @@ fn http_handler(mut stream: TcpStream, handler: HttpHandlerFn) {
             match (request, error) {
                 (Some(ref request), false) =>
                     info!("[{}] {} \"{}\" => {}",
-                          peer_name, request.method, request.path, code),
+                               peer_name, request.method, request.path, code),
                 (Some(ref request), true) =>
                     info!("[{}] {} \"{}\" => {} (NOT SENT)",
                           peer_name, request.method, request.path, code),
@@ -201,6 +139,42 @@ fn http_handler(mut stream: TcpStream, handler: HttpHandlerFn) {
         None => {}
     };
     ()
+}
+
+static CARRIAGE_RETURN: u8 = 13;
+static NEW_LINE: u8 = 10;
+static RN: [u8, ..2] = [CARRIAGE_RETURN, NEW_LINE];
+
+
+pub fn error_page_response(response_code: HTTPResponseCode)
+                       -> (HTTPResponse, ResponseWriterFn)
+{
+    let response_content = format!(
+        "<h1>{} {}</h1>",
+        response_code,
+        match response_code {
+            HTTP400 => " Bad Request",
+            HTTP401 => " Method Not Allowed",
+            HTTP403 => " Access Denied",
+            HTTP404 => " Not Found",
+            HTTP500 => " Server Error",
+            _ => ""
+        });
+    let response_content_length = response_content.as_bytes().iter().count();
+
+    let response = HTTPResponse {
+        code: response_code,
+        headers: vec![HTTPHeader{
+            key: String::from_str("Content-Type"),
+            value: String::from_str("text-html; charset=utf-8")
+        }],
+        content_length: Some(response_content_length as u64),
+    };
+    let response_fn: ResponseWriterFn
+        = proc(mut buf: BufferedWriter<TcpStream>) -> IoResult<()> {
+            buf.write(response_content.as_bytes())
+        };
+    (response, response_fn)
 }
 
 
@@ -255,12 +229,12 @@ fn _http_read_line(reader: &mut BufferedReader<TcpStream>)
             let line_bytes = line_string.as_slice().trim_right_chars(CARRIAGE_RETURN as char);
             String::from_str(line_bytes)
         },
-        Err(e) => return Err(IoError(e))
+        Err(e) => return Err(IOError(e))
     };
     match reader.read_u8() {
         Ok(NEW_LINE) => Ok(result),
         Ok(_) => Err(ParseError),
-        Err(e) => Err(IoError(e))
+        Err(e) => Err(IOError(e))
     }
 }
 
@@ -277,6 +251,7 @@ fn _http_send_response(response: HTTPResponse,
         HTTP301 => "301 Moved",
         HTTP302 => "302 Moved Permanently",
         HTTP400 => "400 Bad Request",
+        HTTP401 => "401 Method Not Allowed",
         HTTP403 => "403 Not Authorized",
         HTTP404 => "404 Not Found",
         HTTP500 => "500 Server Error"
@@ -301,37 +276,4 @@ fn _http_send_response(response: HTTPResponse,
     try!(response_fn(BufferedWriter::with_capacity(1500, stream)));
 
     Ok(())
-}
-
-
-fn hello_world_handler(request: Rc<HTTPRequest>, ref reader: BufferedReader<TcpStream>)
-                       -> Result<(HTTPResponse, ResponseWriterFn), ()>
-{
-    let response = match request.method {
-        GET if request.path == String::from_str("/") => {
-            let response = HTTPResponse {
-                code: HTTP200,
-                headers: vec![
-                    HTTPHeader::new(String::from_str("Content-Type"),
-                                    String::from_str("text-html; charset=utf-8"))]
-            };
-            let response_fn:ResponseWriterFn
-                = proc(mut buf: BufferedWriter<TcpStream>) -> IoResult<()> {
-                    try!(buf.write_str("<h1>Hello world!</h1>"));
-                    try!(buf.write_str("<p>Your headers:</p><table>"));
-                    try!(buf.flush());
-                    for header in request.headers.iter() {
-                        try!(write!(buf, "<tr><td><b>{}</b></td><td>{}</td></tr>\n",
-                                    header.key, header.value));
-                        try!(buf.flush());
-                    }
-                    try!(buf.write_str("</table>"));
-                    Ok(())
-                };
-            (response, response_fn)
-        },
-        GET => error_page_response(HTTP404),
-        _ => error_page_response(HTTP400)
-    };
-    Ok(response)
 }
