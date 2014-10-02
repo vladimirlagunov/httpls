@@ -41,7 +41,33 @@ pub trait HTTPRequestHandler<'hndl, 'req, R: Reader, W: Writer> {
 
 
 pub trait HTTPResponseWriter<W: Writer> {
+    fn get_content_length(&self) -> Option<uint>;
+    fn get_content_type(&self) -> String;
     fn write_data(&self, mut stream: BufferedWriter<W>) -> IoResult<()>;
+}
+
+
+fn update_response_headers<W: Writer>
+    (writer: &HTTPResponseWriter<W>,
+     headers: &mut HTTPHeaders)
+{
+    let content_type_hdr = b"Content-Type".to_vec();
+    if !headers.contains_key(&content_type_hdr) {
+        headers.insert(content_type_hdr,
+                       writer.get_content_type().into_bytes());
+    }
+
+    let content_length_hdr = b"Content-Length".to_vec();
+    if !headers.contains_key(&content_length_hdr) {
+        match writer.get_content_length() {
+            Some(i) => {
+                headers.insert(
+                    content_length_hdr,
+                    i.to_string().into_bytes());
+            },
+            None => {}
+        }
+    }
 }
 
 
@@ -57,12 +83,13 @@ impl <'hndl, 'resp, R: Reader, W: Writer>HTTPHandler<'hndl, 'resp, R, W> {
               mut writer: BufferedWriter<W>)
               -> IoResult<()>
     {
-        let (response_code, response_headers, response_writer) =
+        let (response_code, mut response_headers, response_writer) =
             match handle_http_request(&*self.handler, reader) {
                 Err(_) | Ok(None) => bad_response(),
                     // (HTTP400, box HashMap::new(), box BytesResponseWriter{bytes: vec![]}),
                 Ok(Some(x)) => x
             };
+        update_response_headers(&*response_writer, &mut *response_headers);
         match start_http_response(&mut writer, response_code, &*response_headers) {
             Ok(_) => {
                 response_writer.write_data(writer)
@@ -147,6 +174,14 @@ impl <'a, W: Writer>BytesResponseWriter {
 
 
 impl <W: Writer>HTTPResponseWriter<W> for BytesResponseWriter {
+    fn get_content_length(&self) -> Option<uint> {
+        Some(self.bytes.len())
+    }
+
+    fn get_content_type(&self) -> String {
+        "text/html; charset=utf-8".to_string()
+    }
+
     fn write_data(&self, mut stream: BufferedWriter<W>) -> IoResult<()> {
         stream.write(self.bytes.as_slice())
     }
