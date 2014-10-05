@@ -1,5 +1,5 @@
-#![crate_name="http_server2"]
-#![crate_type="lib"]
+// #![crate_name="http_server2"]
+// #![crate_type="lib"]
 #![feature(macro_rules, phase)]
 #![allow(experimental)]
 
@@ -7,7 +7,8 @@
 
 use std::io::{TcpListener, TcpStream, BufferedReader, BufferedWriter, IoResult, Reader, Buffer, Acceptor, Listener};
 use std::collections::HashMap;
-
+use std::task::{TaskBuilder};
+use std::sync::Arc;
 
 #[deriving(Show)]
 pub enum HTTPMethod {
@@ -27,9 +28,12 @@ pub enum HTTPResponseCode {
 pub type HTTPHeaders = HashMap<Vec<u8>, Vec<u8>>;
 
 
-pub trait HTTPRequestHandler<'hndl, 'req, R: Reader, W: Writer> {
+pub trait HTTPRequestHandler
+    <'hndl, 'req, R: Reader + Send + Sized, W: Writer + Send + Sized>
+    : Send + Sized
+{
     fn handle(
-        &'hndl self,
+        self: &'hndl Self,
         method: HTTPMethod,
         path: Box<Vec<u8>>,
         headers: Box<HTTPHeaders>,
@@ -40,14 +44,14 @@ pub trait HTTPRequestHandler<'hndl, 'req, R: Reader, W: Writer> {
 }
 
 
-pub trait HTTPResponseWriter<W: Writer> {
-    fn get_content_length(&self) -> Option<uint>;
+pub trait HTTPResponseWriter<W: Writer + Send + Sized> {
+    fn get_content_length(&self) -> Option<u64>;
     fn get_content_type(&self) -> String;
     fn write_data(&self, mut stream: BufferedWriter<W>) -> IoResult<()>;
 }
 
 
-fn update_response_headers<W: Writer>
+fn update_response_headers<W: Writer + Send + Sized>
     (writer: &HTTPResponseWriter<W>,
      headers: &mut HTTPHeaders)
 {
@@ -71,40 +75,37 @@ fn update_response_headers<W: Writer>
 }
 
 
-pub struct HTTPHandler<'hndl, 'req, R: Reader, W: Writer> {
-    pub handler: Box<HTTPRequestHandler<'hndl, 'req, R, W> + 'hndl>,
-    pub host: String
-}
-
-
-impl <'hndl, 'resp, R: Reader, W: Writer>HTTPHandler<'hndl, 'resp, R, W> {
-    fn handle(&'hndl self,
-              reader: BufferedReader<R>,
-              mut writer: BufferedWriter<W>)
-              -> IoResult<()>
-    {
-        let (response_code, mut response_headers, response_writer) =
-            match handle_http_request(&*self.handler, reader) {
-                Err(_) | Ok(None) => bad_response(),
-                    // (HTTP400, box HashMap::new(), box BytesResponseWriter{bytes: vec![]}),
-                Ok(Some(x)) => x
-            };
-        update_response_headers(&*response_writer, &mut *response_headers);
-        match start_http_response(&mut writer, response_code, &*response_headers) {
-            Ok(_) => {
-                response_writer.write_data(writer)
-            },
-            Err(e) => Err(e)
-        }
+fn handle_http<'hndl, 'req, R: Reader + Send + Sized, W: Writer + Send + Sized>
+    (handler: &'hndl HTTPRequestHandler<'hndl, 'req, R, W>,
+     reader: BufferedReader<R>,
+     mut writer: BufferedWriter<W>)
+     -> IoResult<()>
+{
+    let (response_code, mut response_headers, response_writer) =
+        match handle_http_request(handler, reader) {
+            Err(_) | Ok(None) => bad_response(),
+            Ok(Some(x)) => x
+        };
+    update_response_headers(&*response_writer, &mut *response_headers);
+    match start_http_response(&mut writer, response_code, &*response_headers) {
+        Ok(_) => {
+            response_writer.write_data(writer)
+        },
+        Err(e) => Err(e)
     }
 }
 
-fn bad_response<'resp, W: Writer>() -> (HTTPResponseCode, Box<HTTPHeaders>, Box<HTTPResponseWriter<W> + 'resp>) {
+fn bad_response<'resp, W: Writer + Send + Sized>
+    ()
+     -> (HTTPResponseCode, Box<HTTPHeaders>,
+         Box<HTTPResponseWriter<W> + 'resp>)
+{
     (HTTP400, box HashMap::new(), box BytesResponseWriter{bytes: vec![]})
 }
 
 
-fn handle_http_request<'hndl, 'req, R: Reader, W: Writer>
+fn handle_http_request
+    <'hndl, 'req, R: Reader + Send + Sized, W: Writer + Send + Sized>
     (handler: &'hndl HTTPRequestHandler<'hndl, 'req, R, W>,
      mut reader: BufferedReader<R>)
      -> IoResult<Option<(HTTPResponseCode,
@@ -166,16 +167,18 @@ pub struct BytesResponseWriter {
 }
 
 
-impl <'a, W: Writer>BytesResponseWriter {
+impl <'a, W: Writer + Send + Sized>BytesResponseWriter {
     pub fn new(bytes: Vec<u8>) -> Box<HTTPResponseWriter<W> + 'a> {
         box BytesResponseWriter{bytes: bytes}
     }
 }
 
 
-impl <W: Writer>HTTPResponseWriter<W> for BytesResponseWriter {
-    fn get_content_length(&self) -> Option<uint> {
-        Some(self.bytes.len())
+impl <W: Writer + Send + Sized>HTTPResponseWriter<W>
+    for BytesResponseWriter
+{
+    fn get_content_length(&self) -> Option<u64> {
+        Some(self.bytes.len() as u64)
     }
 
     fn get_content_type(&self) -> String {
@@ -215,29 +218,23 @@ fn start_http_response<W: Writer>
 }
 
 
+pub fn multi_thread_http_serve
+    <'hndl, 'req, T: HTTPRequestHandler<'hndl, 'req, TcpStream, TcpStream> + Send + Sync + Sized>
+    (host: &str, port: u16, handler: Arc<T>)
+     -> IoResult<()>
+{
+    let listener = TcpListener::bind(host, port);
+    let mut acceptor = listener.listen();
 
-pub struct SingleThreadHTTPServer {
-    pub host: String,
-    pub port: u16,
-}
+    for stream in acceptor.incoming() {
+        let stream = try!(stream);
+        let new_handler = handler.clone();
 
-
-impl <'server, 'hndl, 'req>SingleThreadHTTPServer {
-    pub fn serve(&'server self,
-                 handler: &'hndl HTTPHandler<'hndl, 'req, TcpStream, TcpStream>)
-                 -> IoResult<()> {
-        let listener = TcpListener::bind(self.host.as_slice(), self.port);
-
-        let mut acceptor = listener.listen();
-
-        for stream in acceptor.incoming() {
-            let stream = try!(stream);
-
+        spawn(proc() {
             let reader = BufferedReader::new(stream.clone());
             let writer = BufferedWriter::new(stream);
-
-            try!(handler.handle(reader, writer));
-        }
-        Ok(())
+            handle_http(&*new_handler, reader, writer);
+        });
     }
+    Ok(())
 }
