@@ -1,5 +1,5 @@
-// #![crate_name="http_server2"]
-// #![crate_type="lib"]
+#![crate_name="http_server2"]
+#![crate_type="lib"]
 #![feature(macro_rules, phase)]
 #![allow(experimental)]
 
@@ -29,11 +29,11 @@ pub type HTTPHeaders = HashMap<Vec<u8>, Vec<u8>>;
 
 
 pub trait HTTPRequestHandler
-    <'hndl, 'req, R: Reader + Send + Sized, W: Writer + Send + Sized>
+    <'req, R: Reader + Send + Sized, W: Writer + Send + Sized>
     : Send + Sized
 {
     fn handle(
-        self: &'hndl Self,
+        &self,
         method: HTTPMethod,
         path: Box<Vec<u8>>,
         headers: Box<HTTPHeaders>,
@@ -75,8 +75,8 @@ fn update_response_headers<W: Writer + Send + Sized>
 }
 
 
-fn handle_http<'hndl, 'req, R: Reader + Send + Sized, W: Writer + Send + Sized>
-    (handler: &'hndl HTTPRequestHandler<'hndl, 'req, R, W>,
+fn handle_http<'req, R: Reader + Send + Sized, W: Writer + Send + Sized>
+    (handler: &HTTPRequestHandler<'req, R, W>,
      reader: BufferedReader<R>,
      mut writer: BufferedWriter<W>)
      -> IoResult<()>
@@ -105,8 +105,8 @@ fn bad_response<'resp, W: Writer + Send + Sized>
 
 
 fn handle_http_request
-    <'hndl, 'req, R: Reader + Send + Sized, W: Writer + Send + Sized>
-    (handler: &'hndl HTTPRequestHandler<'hndl, 'req, R, W>,
+    <'req, R: Reader + Send + Sized, W: Writer + Send + Sized>
+    (handler: &HTTPRequestHandler<'req, R, W>,
      mut reader: BufferedReader<R>)
      -> IoResult<Option<(HTTPResponseCode,
                          Box<HTTPHeaders>,
@@ -214,12 +214,13 @@ fn start_http_response<W: Writer>
     }
 
     try!(writer.write_str("\r\n"));
+    try!(writer.flush());
     Ok(())
 }
 
 
 pub fn multi_thread_http_serve
-    <'hndl, 'req, T: HTTPRequestHandler<'hndl, 'req, TcpStream, TcpStream> + Send + Sync + Sized>
+    <'req, T: HTTPRequestHandler<'req, TcpStream, TcpStream> + Send + Sync + Sized>
     (host: &str, port: u16, handler: Arc<T>)
      -> IoResult<()>
 {
