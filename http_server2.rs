@@ -3,25 +3,35 @@
 #![feature(macro_rules, phase)]
 #![allow(experimental)]
 
-#[phase(plugin,link)] extern crate log;
+#[phase(plugin, link)]
+extern crate log;
+
+extern crate time;
+
+extern crate green;
 
 use std::io::{TcpListener, TcpStream, BufferedReader, BufferedWriter, IoResult, Reader, Buffer, Acceptor, Listener};
 use std::collections::HashMap;
 use std::task::{TaskBuilder};
 use std::sync::Arc;
+use time::now;
+
+use green::{SchedPool, PoolConfig, GreenTaskBuilder};
+
 
 #[deriving(Show)]
 pub enum HTTPMethod {
-    GET, POST, HEAD
+    GET, POST, HEAD, NoMethod
 }
 
 
 #[deriving(Show)]
 pub enum HTTPResponseCode {
-    HTTP200,
-    HTTP301, HTTP302,
-    HTTP400, HTTP401, HTTP403, HTTP404,
-    HTTP500
+    HTTP200 = 200,
+    HTTP301 = 301, HTTP302 = 302,
+    HTTP400 = 400, HTTP401 = 401, HTTP403 = 403, HTTP404 = 404,
+    HTTP500 = 500,
+    HTTPERROR = 0,
 }
 
 
@@ -35,8 +45,8 @@ pub trait HTTPRequestHandler
     fn handle(
         &self,
         method: HTTPMethod,
-        path: Box<Vec<u8>>,
-        headers: Box<HTTPHeaders>,
+        path: &Vec<u8>,
+        headers: &HTTPHeaders,
         mut stream: BufferedReader<R>)
         -> IoResult<Option<(HTTPResponseCode,
                             Box<HTTPHeaders>,
@@ -77,40 +87,78 @@ fn update_response_headers<W: Writer + Send + Sized>
 
 fn handle_http<'req, R: Reader + Send + Sized, W: Writer + Send + Sized>
     (handler: &HTTPRequestHandler<'req, R, W>,
-     reader: BufferedReader<R>,
+     mut reader: BufferedReader<R>,
      mut writer: BufferedWriter<W>)
      -> IoResult<()>
 {
-    let (response_code, mut response_headers, response_writer) =
-        match handle_http_request(handler, reader) {
-            Err(_) | Ok(None) => bad_response(),
-            Ok(Some(x)) => x
+    let bad_req = proc
+        (x: IoResult<Option<()>>)
+         -> (IoResult<Option<()>>, HTTPMethod, Box<Vec<u8>>, Box<HTTPHeaders>)
+    {
+        (x, NoMethod, box b"".to_vec(), box HashMap::new())
+    };
+
+    let start_time = now().to_timespec();
+
+    let (req_ok, request_method, request_path, request_headers) =
+        match parse_http_request(&mut reader) {
+            Ok(Some((m, p, h))) => (Ok(Some(())), m, p, h),
+            Ok(None) => bad_req(Ok(None)),
+            Err(e) => bad_req(Err(e)),
         };
+
+    let request_duration = now().to_timespec() - start_time;
+
+    let handler_result = match req_ok {
+        Ok(Some(())) => handler.handle(
+            request_method, &*request_path, &*request_headers, reader),
+        Ok(None) => Ok(None),
+        Err(e) => Err(e),
+    };
+
+    let (response_code, mut response_headers, response_writer) =
+        match handler_result {
+            Ok(Some((c, h, w))) => (c, h, w),
+            _ => {
+                let writer: Box<HTTPResponseWriter<W>> =
+                    box BytesResponseWriter{bytes: vec![]};
+                (HTTP400, box HashMap::new(), writer)
+            },
+        };
+
     update_response_headers(&*response_writer, &mut *response_headers);
     match start_http_response(&mut writer, response_code, &*response_headers) {
         Ok(_) => {
-            response_writer.write_data(writer)
+            let response_headers_duration = now().to_timespec() - start_time;
+            let result = response_writer.write_data(writer);
+            let response_end_duration = now().to_timespec() - start_time;
+
+            info!("{} \"{}\" - {} (req: {:0.4f}s, resp: {:0.4f}s, end: {:0.4f}s)",
+                  request_method,
+                  match String::from_utf8(*request_path) {
+                      Ok(s) => s,
+                      Err(s) => format!("{}", s),
+                  },
+                  response_code as int,
+                  request_duration.num_milliseconds() as f64 / 1000.0,
+                  response_headers_duration.num_milliseconds() as f64 / 1000.0,
+                  response_end_duration.num_milliseconds() as f64 / 1000.0
+                  );
+            result
         },
         Err(e) => Err(e)
     }
 }
 
-fn bad_response<'resp, W: Writer + Send + Sized>
-    ()
-     -> (HTTPResponseCode, Box<HTTPHeaders>,
-         Box<HTTPResponseWriter<W> + 'resp>)
-{
-    (HTTP400, box HashMap::new(), box BytesResponseWriter{bytes: vec![]})
-}
 
-
-fn handle_http_request
-    <'req, R: Reader + Send + Sized, W: Writer + Send + Sized>
-    (handler: &HTTPRequestHandler<'req, R, W>,
-     mut reader: BufferedReader<R>)
-     -> IoResult<Option<(HTTPResponseCode,
-                         Box<HTTPHeaders>,
-                         Box<HTTPResponseWriter<W> + 'req>)>>
+#[inline(always)]
+fn parse_http_request<R: Reader + Send + Sized>
+    (reader: &mut BufferedReader<R>)
+     -> IoResult<Option<(
+         HTTPMethod,
+         Box<Vec<u8>>,  // path
+         Box<HTTPHeaders>,  // request headers
+         )>>
 {
     let request_method = match try!(reader.read_until(b' ')).as_slice() {
         b"GET " => GET,
@@ -158,7 +206,10 @@ fn handle_http_request
         headers
     };
 
-    handler.handle(request_method, request_path, request_headers, reader)
+    Ok(Some((request_method,
+             request_path,
+             request_headers,
+             )))
 }
 
 
@@ -234,7 +285,33 @@ pub fn multi_thread_http_serve
         spawn(proc() {
             let reader = BufferedReader::new(stream.clone());
             let writer = BufferedWriter::new(stream);
-            handle_http(&*new_handler, reader, writer);
+            let result: IoResult<()> = handle_http(&*new_handler, reader, writer);
+            result.unwrap()
+        });
+    }
+    Ok(())
+}
+
+
+pub fn green_http_serve
+    <'req, T: HTTPRequestHandler<'req, TcpStream, TcpStream> + Send + Sync + Sized>
+    (host: &str, port: u16, handler: Arc<T>)
+     -> IoResult<()>
+{
+    let mut pool = SchedPool::new(PoolConfig::new());
+
+    let listener = TcpListener::bind(host, port);
+    let mut acceptor = listener.listen();
+
+    for stream in acceptor.incoming() {
+        let stream = try!(stream);
+        let new_handler = handler.clone();
+
+        TaskBuilder::new().green(&mut pool).spawn(proc() {
+            let reader = BufferedReader::new(stream.clone());
+            let writer = BufferedWriter::new(stream);
+            let result: IoResult<()> = handle_http(&*new_handler, reader, writer);
+            result.unwrap()
         });
     }
     Ok(())
